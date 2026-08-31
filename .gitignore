@@ -1,0 +1,11 @@
+.gradle/
+build/
+dist/
+bin/
+lib/
+.settings/
+.classpath
+.project
+gradle.properties
+.mcp.json
+.claude/

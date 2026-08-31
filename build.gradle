@@ -1,0 +1,522 @@
+// Builds the Eclipse MCP Server as a plain OSGi bundle — no PDE, no Tycho.
+//
+// The bundle is a fat-ish jar: our classes at the root, the whole MCP/Jetty/Jackson
+// runtime closure nested under lib/ and listed in Bundle-ClassPath. Eclipse ships
+// Jetty 12 ee8/javax and Jackson 2 only, so nothing in our stack may be imported
+// from the platform — hence no Import-Package for jetty/jackson/servlet/slf4j/mcp
+// and no Export-Package at all.
+//
+// Machine paths come from gradle.properties (gitignored) or the environment:
+//
+//     ECLIPSE_INSTALL_DIR    read-only Eclipse deploy; source of the compile jars
+//     ECLIPSE_USER_POOL_DIR  writable p2 pool; where `install` drops the bundle
+//     ECLIPSE_INSTALL_AREA   the install area as the *running* (flatpak) Eclipse
+//                            sees it; bundles.info locations are relative to it
+
+plugins {
+	id 'java'
+}
+
+repositories {
+	mavenCentral()
+}
+
+def versionProps = new Properties()
+file('version.properties').withInputStream { versionProps.load(it) }
+def semver = versionProps.getProperty('version', '0.0.0')
+
+// Every build gets a fresh OSGi version. Equinox caches resolved bundles by
+// version; without a moving qualifier a reinstall of "0.1.0" can be served from
+// the cache and the restart silently runs the old code.
+ext.bundleQualifier = new Date().format('yyyyMMddHHmm')
+ext.bundleVersion = "${semver}.${bundleQualifier}"
+
+version = semver
+
+tasks.withType(JavaCompile).configureEach {
+	options.release = 21
+	options.encoding = 'UTF-8'
+}
+
+// ---------------------------------------------------------------------------
+// Machine-specific locations
+// ---------------------------------------------------------------------------
+
+def eclipseSetting = { String name ->
+	providers.gradleProperty(name).orElse(providers.environmentVariable(name))
+}
+
+def eclipseSettingHelp = { String name ->
+	"${name} is not set.\n" +
+	"  Set it in gradle.properties (gitignored) or export it, e.g.\n" +
+	"      ${name}=/path/to/eclipse\n" +
+	"  See the header comment of build.gradle for what each ECLIPSE_* path means."
+}
+
+def eclipseInstallDirProvider = eclipseSetting('ECLIPSE_INSTALL_DIR')
+def eclipseUserPoolDirProvider = eclipseSetting('ECLIPSE_USER_POOL_DIR')
+def eclipseInstallAreaProvider = eclipseSetting('ECLIPSE_INSTALL_AREA')
+
+// Needed to build the compile classpath, so it has to resolve at configuration time.
+def eclipseInstallDir = eclipseInstallDirProvider.getOrNull()
+if (!eclipseInstallDir) {
+	throw new GradleException(eclipseSettingHelp('ECLIPSE_INSTALL_DIR'))
+}
+
+// The install tasks resolve theirs lazily — `gradlew jar` must work on a machine
+// that has no Eclipse to install into.
+def requireSetting = { org.gradle.api.provider.Provider<String> p, String name ->
+	def v = p.getOrNull()
+	if (!v) {
+		throw new GradleException(eclipseSettingHelp(name))
+	}
+	return v
+}
+
+// ---------------------------------------------------------------------------
+// Compile classpath: curated Eclipse API bundles, version-agnostic
+// ---------------------------------------------------------------------------
+
+// Exactly the bundles our sources touch. Version-agnostic globs so an Eclipse
+// point release does not need a build edit — but every glob is asserted below,
+// so a *renamed* or dropped bundle fails loudly instead of producing a thousand
+// "cannot find symbol" errors.
+def eclipseBundles = [
+	'org.eclipse.osgi',
+	'org.eclipse.equinox.common',
+	'org.eclipse.equinox.registry',
+	'org.eclipse.equinox.preferences',
+	'org.eclipse.equinox.app',
+	'org.eclipse.core.runtime',
+	'org.eclipse.core.jobs',
+	'org.eclipse.core.contenttype',
+	'org.eclipse.core.expressions',
+	'org.eclipse.core.filesystem',
+	'org.eclipse.core.resources',
+	'org.eclipse.core.variables',
+	'org.eclipse.text',
+	'org.eclipse.jdt.core',
+	'org.eclipse.debug.core',
+	'org.eclipse.jdt.launching',
+	// Compile-only for util/UiThread (the phase-2 UI door). Deliberately NOT in
+	// Require-Bundle: no MVP tool loads the class, and loading it without the SWT
+	// wire is a LinkageError its callers are required to catch.
+	'org.eclipse.swt.gtk.linux.x86_64',
+]
+
+def eclipsePluginsDir = file("${eclipseInstallDir}/plugins")
+
+def eclipseApiJars = fileTree(eclipsePluginsDir) {
+	eclipseBundles.each { include "${it}_*.jar" }
+	// "<bsn>.source_<version>.jar" cannot match a "<bsn>_" glob today; the exclude
+	// keeps it that way if a glob is ever loosened.
+	exclude '*.source_*.jar'
+}
+
+def unmatchedBundles = eclipseBundles.findAll { name ->
+	!eclipseApiJars.files.any { it.name.startsWith(name + '_') }
+}
+if (!unmatchedBundles.isEmpty()) {
+	throw new GradleException(
+		"No jar matched these Eclipse bundle(s) in ${eclipsePluginsDir}:\n" +
+		unmatchedBundles.collect { "    ${it}_*.jar" }.join('\n') + "\n" +
+		"  Either ECLIPSE_INSTALL_DIR points at the wrong tree, or this Eclipse\n" +
+		"  renamed/dropped the bundle — fix the list in build.gradle.")
+}
+
+dependencies {
+	// MCP Java SDK (aggregator: mcp-core + the Jackson 3 JSON binding)
+	implementation 'io.modelcontextprotocol.sdk:mcp:2.0.0'
+
+	// Jetty 12 (ee11 = jakarta.servlet 6.1, matching the SDK's servlet transport)
+	implementation 'org.eclipse.jetty:jetty-server:12.1.4'
+	implementation 'org.eclipse.jetty.ee11:jetty-ee11-servlet:12.1.4'
+
+	// Eclipse's own SLF4J binding is not reachable from our private classpath, and an
+	// unbound SLF4J 2.x prints a warning per JVM; simple-logger keeps it quiet.
+	// Level comes from src/main/resources/simplelogger.properties.
+	runtimeOnly 'org.slf4j:slf4j-simple:2.0.17'
+
+	// Platform API: provided by the framework at runtime via Require-Bundle, so it
+	// must never be nested under lib/.
+	compileOnly files(eclipseApiJars)
+}
+
+tasks.register('printEclipseClasspath') {
+	group = 'help'
+	description = 'List the Eclipse API jars resolved for the compile classpath'
+	doLast {
+		eclipseApiJars.files.sort { it.name }.each { println it }
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Build stamp
+// ---------------------------------------------------------------------------
+
+// Stamp version + git commit (+dirty) + build time into a classpath-root resource
+// the running server reports (GET /version, get_workspace_info, the startup log
+// line), so "which build is Eclipse actually running?" is answerable over the wire
+// instead of by guessing from restart choreography. BuildInfo.java reads it as
+// "/eclipsemcp-build.properties" — jar root, not a package.
+def buildInfoDir = layout.buildDirectory.dir('generated/buildinfo')
+
+tasks.register('generateBuildInfo') {
+	group = 'build'
+	description = 'Write eclipsemcp-build.properties with version, git commit and build time'
+	outputs.dir(buildInfoDir)
+	// Git state is not a tracked input; restamp on every build (the file is tiny).
+	outputs.upToDateWhen { false }
+	def projectDirectory = projectDir
+	def stampedVersion = semver
+	doLast {
+		def git = 'nogit'
+		try {
+			def hash = 'git rev-parse --short HEAD'.execute(null, projectDirectory).text.trim()
+			def dirty = 'git status --porcelain'.execute(null, projectDirectory).text.trim()
+			if (!hash.isEmpty()) {
+				git = hash + (dirty.isEmpty() ? '' : '+dirty')
+			}
+		}
+		catch (Exception ignored) {
+			// no git binary, or not a repository — 'nogit' is the honest answer
+		}
+		def dir = buildInfoDir.get().asFile
+		dir.mkdirs()
+		new File(dir, 'eclipsemcp-build.properties').text =
+			"version=${stampedVersion}\n" +
+			"git=${git}\n" +
+			"built=${new Date().format("yyyy-MM-dd HH:mm:ss 'UTC'", TimeZone.getTimeZone('UTC'))}\n"
+	}
+}
+
+tasks.named('processResources') {
+	dependsOn 'generateBuildInfo'
+	from buildInfoDir
+}
+
+// ---------------------------------------------------------------------------
+// The bundle jar
+// ---------------------------------------------------------------------------
+
+def bundleSymbolicName = 'ebbex.eclipsemcpserver'
+def activatorClass = 'ebbex.eclipsemcpserver.Activator'
+
+tasks.named('jar', Jar) {
+	archiveFileName = "${bundleSymbolicName}_${bundleVersion}.jar"
+
+	into('lib') {
+		from configurations.runtimeClasspath
+	}
+
+	manifest {
+		attributes(
+			'Bundle-ManifestVersion': '2',
+			'Bundle-Name': 'Eclipse MCP Server',
+			'Bundle-SymbolicName': "${bundleSymbolicName};singleton:=true",
+			'Bundle-Version': bundleVersion,
+			'Bundle-Vendor': 'ebbex',
+			'Bundle-Activator': activatorClass,
+			'Automatic-Module-Name': bundleSymbolicName,
+			'Require-Capability': 'osgi.ee;filter:="(&(osgi.ee=JavaSE)(version=21))"',
+			// Lower bounds are the versions this Eclipse (4.40) ships; debug.core and
+			// jdt.launching are NOT optional — the launch tools are half the MVP and
+			// both bundles are always present in a JDT install.
+			'Require-Bundle': [
+				'org.eclipse.core.runtime;bundle-version="[3.34.0,4.0.0)"',
+				'org.eclipse.core.resources;bundle-version="[3.24.0,4.0.0)"',
+				'org.eclipse.core.filesystem;bundle-version="[1.11.0,2.0.0)"',
+				'org.eclipse.text;bundle-version="[3.14.0,4.0.0)"',
+				'org.eclipse.jdt.core;bundle-version="[3.46.0,4.0.0)"',
+				'org.eclipse.debug.core;bundle-version="[3.23.0,4.0.0)"',
+				'org.eclipse.jdt.launching;bundle-version="[3.24.0,4.0.0)"',
+			].join(','),
+			// The only package we need wired from outside our own classpath. No
+			// Export-Package: nothing here is API. No lazy activation policy: the
+			// bundles.info autostart flag starts us eagerly.
+			'Import-Package': 'org.osgi.framework;version="[1.10,2.0)"',
+		)
+	}
+
+	// Bundle-ClassPath has to name the jars actually nested, so it is computed from
+	// the resolved configuration at execution time rather than a hand-kept list.
+	doFirst {
+		def nested = configurations.runtimeClasspath.files.collect { "lib/${it.name}" }
+		manifest.attributes('Bundle-ClassPath': (['.'] + nested).join(','))
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Packaging integrity
+// ---------------------------------------------------------------------------
+
+def builtJarProvider = tasks.named('jar', Jar).flatMap { it.archiveFile }
+
+// The failure mode this catches: a Bundle-ClassPath entry that does not exist makes
+// Equinox resolve the bundle and then fail at the first class load, with an error
+// that points nowhere near the build. Cheap, offline, runs under `check`.
+tasks.register('verifyManifest') {
+	group = 'verification'
+	description = 'Reopen the built jar and assert the OSGi packaging is internally consistent'
+	dependsOn tasks.named('jar')
+	inputs.file(builtJarProvider)
+	def jarFileProvider = builtJarProvider
+	def expectedActivatorEntry = activatorClass.replace('.', '/') + '.class'
+	doLast {
+		def jarFile = jarFileProvider.get().asFile
+		def problems = []
+		new java.util.jar.JarFile(jarFile).withCloseable { jar ->
+			def manifest = jar.manifest
+			if (manifest == null) {
+				throw new GradleException("${jarFile.name} has no META-INF/MANIFEST.MF")
+			}
+			def attrs = manifest.mainAttributes
+			def header = { String name -> attrs.getValue(name) }
+
+			['Bundle-SymbolicName', 'Bundle-Version', 'Bundle-Activator'].each { name ->
+				if (!header(name)) {
+					problems << "manifest header ${name} is missing"
+				}
+			}
+
+			def classPath = header('Bundle-ClassPath')
+			if (!classPath) {
+				problems << 'manifest header Bundle-ClassPath is missing'
+			}
+			else {
+				classPath.split(',').collect { it.trim() }.findAll { it && it != '.' }.each { entry ->
+					if (jar.getEntry(entry) == null) {
+						problems << "Bundle-ClassPath entry ${entry} is not in the jar"
+					}
+				}
+			}
+
+			if (jar.getEntry(expectedActivatorEntry) == null) {
+				problems << "activator class ${expectedActivatorEntry} is not in the jar"
+			}
+			if (jar.getEntry('eclipsemcp-build.properties') == null) {
+				problems << 'eclipsemcp-build.properties is not at the jar root (BuildInfo reads /eclipsemcp-build.properties)'
+			}
+			if (jar.getEntry('simplelogger.properties') == null) {
+				problems << 'simplelogger.properties is not at the jar root (SLF4J simple reads it from the classpath root)'
+			}
+		}
+		if (!problems.isEmpty()) {
+			throw new GradleException("${jarFile.name} failed manifest verification:\n" +
+				problems.collect { "    ${it}" }.join('\n'))
+		}
+		logger.lifecycle("verifyManifest: ${jarFile.name} OK")
+	}
+}
+
+tasks.named('check') {
+	dependsOn tasks.named('verifyManifest')
+}
+
+tasks.register('copyToDist', Copy) {
+	group = 'build'
+	description = 'Copy the built bundle jar into dist/'
+	dependsOn tasks.named('jar')
+	def distDir = file('dist')
+	doFirst {
+		// Only one build of a singleton bundle should ever be lying around.
+		distDir.listFiles()?.each { f ->
+			if (f.name.startsWith("${bundleSymbolicName}_") && f.name.endsWith('.jar')) {
+				f.delete()
+			}
+		}
+	}
+	from builtJarProvider
+	into distDir
+}
+
+// ---------------------------------------------------------------------------
+// Install into the running Eclipse's writable p2 pool
+// ---------------------------------------------------------------------------
+//
+// No PDE and no p2 repository, so installing is two mechanical steps: drop the jar
+// in <pool>/plugins and add one line to simpleconfigurator's bundles.info. The
+// trailing "true" is the autostart flag — that is what invokes our Activator.
+//
+// Known cost: any p2 operation (Install New Software, update) regenerates
+// bundles.info from the p2 profile and silently drops our line. `installStatus`
+// and a failing GET /version both surface it; re-run `install`.
+
+def bundlesInfoRelPath = 'configuration/org.eclipse.equinox.simpleconfigurator/bundles.info'
+
+// Read/modify/write of bundles.info. Comment lines at the top (#encoding, #version)
+// are preserved verbatim; any existing line for our BSN is dropped (never two
+// versions of a singleton); a new line, if given, lands in sorted position.
+def rewriteBundlesInfo = { File bundlesInfo, String bsn, String newLine ->
+	if (!bundlesInfo.isFile()) {
+		throw new GradleException("bundles.info not found at ${bundlesInfo}\n" +
+			"  ECLIPSE_USER_POOL_DIR does not look like an Eclipse configuration area.")
+	}
+	def lines = bundlesInfo.readLines()
+	def leading = []
+	def rest = []
+	def stillLeading = true
+	lines.each { line ->
+		if (stillLeading && line.startsWith('#')) {
+			leading << line
+		}
+		else {
+			stillLeading = false
+			if (!line.trim().isEmpty()) {
+				rest << line
+			}
+		}
+	}
+	def bsnOf = { String line -> line.split(',', -1)[0] }
+	def before = rest.size()
+	rest = rest.findAll { bsnOf(it) != bsn }
+	def removed = rest.size() != before
+	if (newLine != null) {
+		def at = rest.findIndexOf { bsnOf(it) > bsn }
+		if (at < 0) {
+			rest << newLine
+		}
+		else {
+			rest.add(at, newLine)
+		}
+	}
+	// Atomic replace: a half-written bundles.info bricks the IDE's next start.
+	def tmp = File.createTempFile('bundles.info', '.tmp', bundlesInfo.parentFile)
+	tmp.text = (leading + rest).join('\n') + '\n'
+	java.nio.file.Files.move(tmp.toPath(), bundlesInfo.toPath(),
+		java.nio.file.StandardCopyOption.REPLACE_EXISTING,
+		java.nio.file.StandardCopyOption.ATOMIC_MOVE)
+	return removed
+}
+
+def removeInstalledBundle = { File poolDir, org.gradle.api.logging.Logger log ->
+	def pluginsDir = new File(poolDir, 'plugins')
+	def deleted = []
+	pluginsDir.listFiles()?.each { f ->
+		if (f.name.startsWith("${bundleSymbolicName}_") && f.name.endsWith('.jar')) {
+			if (f.delete()) {
+				deleted << f.name
+			}
+		}
+	}
+	def dropped = rewriteBundlesInfo(new File(poolDir, bundlesInfoRelPath), bundleSymbolicName, null)
+	if (deleted.isEmpty() && !dropped) {
+		log.lifecycle("uninstall: nothing to remove from ${poolDir}")
+	}
+	else {
+		deleted.each { log.lifecycle("uninstall: deleted plugins/${it}") }
+		if (dropped) {
+			log.lifecycle("uninstall: removed the ${bundleSymbolicName} line from bundles.info")
+		}
+	}
+}
+
+tasks.register('uninstall') {
+	group = 'eclipse'
+	description = 'Remove the bundle jar and its bundles.info line from the Eclipse pool'
+	def poolDirProvider = eclipseUserPoolDirProvider
+	doLast {
+		removeInstalledBundle(file(requireSetting(poolDirProvider, 'ECLIPSE_USER_POOL_DIR')), logger)
+	}
+}
+
+tasks.register('install') {
+	group = 'eclipse'
+	description = 'Install the built bundle into the Eclipse pool (restart Eclipse to load it)'
+	dependsOn tasks.named('jar'), tasks.named('verifyManifest')
+	def poolDirProvider = eclipseUserPoolDirProvider
+	def installAreaProvider = eclipseInstallAreaProvider
+	def jarFileProvider = builtJarProvider
+	def installedBundleVersion = bundleVersion
+	doLast {
+		def poolDir = file(requireSetting(poolDirProvider, 'ECLIPSE_USER_POOL_DIR'))
+		def installArea = requireSetting(installAreaProvider, 'ECLIPSE_INSTALL_AREA')
+		// Uninstall inline rather than as a dependency: the delete must happen before
+		// the copy, and task ordering is a weaker guarantee than a statement order.
+		removeInstalledBundle(poolDir, logger)
+
+		def source = jarFileProvider.get().asFile
+		def pluginsDir = new File(poolDir, 'plugins')
+		pluginsDir.mkdirs()
+		def target = new File(pluginsDir, source.name)
+		java.nio.file.Files.copy(source.toPath(), target.toPath(),
+			java.nio.file.StandardCopyOption.REPLACE_EXISTING)
+
+		// bundles.info locations are relative to the install area *as the running
+		// Eclipse sees it* — inside the flatpak sandbox that is /app/eclipse, not the
+		// host deploy path, so this cannot be derived from ECLIPSE_INSTALL_DIR.
+		def relPath = java.nio.file.Paths.get(installArea)
+			.relativize(target.toPath().toAbsolutePath().normalize())
+			.toString()
+		def line = "${bundleSymbolicName},${installedBundleVersion},${relPath},4,true"
+		rewriteBundlesInfo(new File(poolDir, bundlesInfoRelPath), bundleSymbolicName, line)
+
+		logger.lifecycle("install: ${target}")
+		logger.lifecycle("install: bundles.info += ${line}")
+		logger.lifecycle('install: restart Eclipse, then ./gradlew probe')
+	}
+}
+
+tasks.register('installStatus') {
+	group = 'eclipse'
+	description = 'Report whether the bundle is installed in the Eclipse pool and p2 state is intact'
+	def poolDirProvider = eclipseUserPoolDirProvider
+	doLast {
+		def poolDir = file(requireSetting(poolDirProvider, 'ECLIPSE_USER_POOL_DIR'))
+		println "pool: ${poolDir}"
+
+		def jars = new File(poolDir, 'plugins').listFiles()?.findAll {
+			it.name.startsWith("${bundleSymbolicName}_") && it.name.endsWith('.jar')
+		}?.sort { it.name } ?: []
+		if (jars.isEmpty()) {
+			println "jar:  ABSENT — run ./gradlew install"
+		}
+		else {
+			jars.each { println "jar:  plugins/${it.name}" }
+			if (jars.size() > 1) {
+				println "jar:  WARNING — more than one version of a singleton bundle"
+			}
+		}
+
+		def bundlesInfo = new File(poolDir, bundlesInfoRelPath)
+		def entry = bundlesInfo.isFile() ?
+			bundlesInfo.readLines().find { it.split(',', -1)[0] == bundleSymbolicName } : null
+		println entry ? "line: ${entry}" : "line: ABSENT — run ./gradlew install"
+
+		// Sanity check on the p2 state itself: if simpleconfigurator is not wired in,
+		// bundles.info is not read at all and no amount of installing helps. The user
+		// config.ini normally inherits the key from the shared install config it points at.
+		def configKey = 'org.eclipse.equinox.simpleconfigurator.configUrl'
+		def userConfig = new File(poolDir, 'configuration/config.ini')
+		def userText = userConfig.isFile() ? userConfig.text : ''
+		if (userText.contains(configKey)) {
+			println "p2:   ${configKey} present in ${userConfig}"
+		}
+		else {
+			def shared = (userText =~ /(?m)^osgi\.sharedConfiguration\.area=(.*)$/)
+			if (shared) {
+				println "p2:   ${configKey} not in the user config.ini; inherited from the " +
+					"shared configuration area (osgi.sharedConfiguration.area=${shared[0][1].trim()})"
+			}
+			else {
+				println "p2:   WARNING — ${configKey} not found and no shared configuration " +
+					"area declared in ${userConfig}; bundles.info may not be read at all"
+			}
+		}
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Live verification against the running IDE
+// ---------------------------------------------------------------------------
+
+// Offline checks stop at the jar; this one answers "is the Eclipse I am talking to
+// running the build I just made, and do both endpoints serve their tools?".
+tasks.register('probe', Exec) {
+	group = 'verification'
+	description = 'Probe the MCP server in the running Eclipse (build stamp + tools/list per endpoint)'
+	// No build dependencies: the script compares the server against the newest
+	// already-built jar. Rebuilding here would restamp and always report "stale".
+	workingDir projectDir
+	commandLine "${projectDir}/tools/probe.sh"
+}
