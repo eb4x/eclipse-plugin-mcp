@@ -50,10 +50,15 @@ Entry template:
 - **Verified**: after touch+refresh, `list_launches` shows
   `Ghidra (Java Application)` and `manage_launch` launches it. Confirmed on the
   0.1.1 restart that the index does **not** survive an IDE restart — the
-  touch+refresh dance is needed once per session. Phase 2: have `manage_launch`
-  fall back to scanning open projects for `<name>.launch` and using
-  `ILaunchManager.getLaunchConfiguration(IFile)` so shared configs are
-  addressable by name without the ritual.
+  touch+refresh dance was needed once per session.
+- **Fix (0.2.0)**: `tools/launch/LaunchConfigs` merges the manager's index with
+  a proxy-visitor scan of open projects for `*.launch` files, handing back
+  `ILaunchManager.getLaunchConfiguration(IFile)` handles — shared configs are
+  addressable by name (and visible in `list_launches kind=configurations`)
+  straight after a restart, no ritual.
+- **Verified**: freshly restarted IDE, no touch/refresh: `manage_launch
+  op=launch configuration=Ghidra` resolves and launches. (Re-verify note kept
+  current with the 0.2.0 rollout.)
 
 ## 2026-08-31 bare `list_launches {}` rejected — `kind` was required
 

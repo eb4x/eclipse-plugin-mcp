@@ -105,7 +105,7 @@ public class ListLaunchesTool implements Tool {
 		}
 
 		List<String> lines = switch (kind) {
-			case "configurations" -> configurations(manager, filter);
+			case "configurations" -> configurations(manager, workspace, filter);
 			case "active" -> active(manager, filter);
 			default -> throw new IllegalArgumentException(
 				"Unknown kind '" + kind + "'; expected one of " + KINDS);
@@ -118,11 +118,14 @@ public class ListLaunchesTool implements Tool {
 		return Results.ok(page(lines, offset, limit));
 	}
 
-	private static List<String> configurations(ILaunchManager manager, String filter)
-			throws Exception {
+	private static List<String> configurations(ILaunchManager manager, IWorkspace workspace,
+			String filter) throws Exception {
 		List<ILaunchConfiguration> configs = new ArrayList<>();
-		for (ILaunchConfiguration config : manager.getLaunchConfigurations()) {
-			if (config.isPrototype() || !matches(config.getName(), filter)) {
+		// LaunchConfigs merges in shared .launch files the manager has not indexed, so the
+		// listing shows every name manage_launch accepts — including right after an IDE
+		// restart, when the platform's own index has forgotten them.
+		for (ILaunchConfiguration config : LaunchConfigs.all(manager, workspace)) {
+			if (isPrototype(config) || !matches(config.getName(), filter)) {
 				continue;
 			}
 			configs.add(config);
@@ -191,6 +194,16 @@ public class ListLaunchesTool implements Tool {
 
 		entries.sort(Comparator.comparingLong(Entry::started).reversed());
 		return entries.stream().map(Entry::text).toList();
+	}
+
+	/** Prototype check that tolerates a shared handle over a malformed .launch file. */
+	private static boolean isPrototype(ILaunchConfiguration config) {
+		try {
+			return config.isPrototype();
+		}
+		catch (Exception e) {
+			return false;
+		}
 	}
 
 	private static String typeName(ILaunchConfiguration config) {

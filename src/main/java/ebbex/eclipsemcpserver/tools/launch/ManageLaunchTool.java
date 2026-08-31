@@ -140,7 +140,7 @@ public class ManageLaunchTool implements Tool {
 		int waitSeconds = Math.max(1, Args.intArg(args, "wait_seconds", DEFAULT_WAIT_SECONDS));
 
 		return switch (op) {
-			case "launch" -> launch(args, manager, waitSeconds);
+			case "launch" -> launch(args, manager, workspace, waitSeconds);
 			case "terminate" -> terminate(args, manager, waitSeconds);
 			default -> throw new IllegalArgumentException(
 				"Unknown op '" + op + "'; expected one of " + OPS);
@@ -150,7 +150,7 @@ public class ManageLaunchTool implements Tool {
 	// ------------------------------------------------------------------ launch
 
 	private McpSchema.CallToolResult launch(Map<String, Object> args, ILaunchManager manager,
-			int waitSeconds) throws Exception {
+			IWorkspace workspace, int waitSeconds) throws Exception {
 		String name = Args.stringArg(args, "configuration", null);
 		if (name == null || name.isBlank()) {
 			throw new IllegalArgumentException(
@@ -165,7 +165,7 @@ public class ManageLaunchTool implements Tool {
 		boolean terminateExisting = Args.boolArg(args, "terminate_existing", true);
 		boolean ignoreErrors = Args.boolArg(args, "ignore_errors", false);
 
-		ILaunchConfiguration config = requireConfiguration(manager, name);
+		ILaunchConfiguration config = requireConfiguration(manager, workspace, name);
 		if (!config.supportsMode(mode)) {
 			throw new IllegalArgumentException("Launch configuration '" + config.getName() +
 				"' does not support mode '" + mode + "' (supported: " + config.getModes() + ")");
@@ -405,9 +405,11 @@ public class ManageLaunchTool implements Tool {
 
 	// ------------------------------------------------------------------ shared
 
-	private static ILaunchConfiguration requireConfiguration(ILaunchManager manager, String name)
-			throws Exception {
-		ILaunchConfiguration[] configs = manager.getLaunchConfigurations();
+	private static ILaunchConfiguration requireConfiguration(ILaunchManager manager,
+			IWorkspace workspace, String name) throws Exception {
+		// LaunchConfigs also finds shared .launch files the manager has not indexed —
+		// the routine post-restart state for configs checked into a project.
+		List<ILaunchConfiguration> configs = LaunchConfigs.all(manager, workspace);
 		for (ILaunchConfiguration config : configs) {
 			if (config.getName().equals(name)) {
 				return config;
@@ -422,7 +424,7 @@ public class ManageLaunchTool implements Tool {
 		}
 		if (close.isEmpty()) {
 			throw new IllegalArgumentException("No launch configuration named '" + name +
-				"' (list_launches kind=configurations shows the " + configs.length + " names)");
+				"' (list_launches kind=configurations shows the " + configs.size() + " names)");
 		}
 		throw new IllegalArgumentException("No launch configuration named exactly '" + name +
 			"'. Did you mean: " + String.join(", ", close.subList(0, Math.min(10, close.size()))) +
