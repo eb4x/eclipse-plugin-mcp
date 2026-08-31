@@ -48,10 +48,12 @@ Entry template:
   `manage_projects op=refresh project=<its project>` — the delta imports it and
   it stays addressable by name for the session.
 - **Verified**: after touch+refresh, `list_launches` shows
-  `Ghidra (Java Application)` and `manage_launch` launches it. Watch whether the
-  index survives an IDE restart; if not, consider having `manage_launch` fall
-  back to scanning open projects for `<name>.launch` and using
-  `ILaunchManager.getLaunchConfiguration(IFile)`.
+  `Ghidra (Java Application)` and `manage_launch` launches it. Confirmed on the
+  0.1.1 restart that the index does **not** survive an IDE restart — the
+  touch+refresh dance is needed once per session. Phase 2: have `manage_launch`
+  fall back to scanning open projects for `<name>.launch` and using
+  `ILaunchManager.getLaunchConfiguration(IFile)` so shared configs are
+  addressable by name without the ritual.
 
 ## 2026-08-31 bare `list_launches {}` rejected — `kind` was required
 
