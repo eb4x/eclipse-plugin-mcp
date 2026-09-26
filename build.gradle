@@ -338,9 +338,11 @@ tasks.register('copyToDist', Copy) {
 // in <pool>/plugins and add one line to simpleconfigurator's bundles.info. The
 // trailing "true" is the autostart flag — that is what invokes our Activator.
 //
-// Known cost: any p2 operation (Install New Software, update) regenerates
-// bundles.info from the p2 profile and silently drops our line. `installStatus`
-// and a failing GET /version both surface it; re-run `install`.
+// Known cost: any p2 operation (Install New Software, update, base flatpak upgrade)
+// rewrites bundles.info from the p2 profile. It either drops our line outright or
+// keeps it with the autostart flag reset to false — the second is the quiet one, so
+// `installStatus` asserts the flag rather than just the line's presence. A failing
+// GET /version surfaces both; re-run `install`.
 
 def bundlesInfoRelPath = 'configuration/org.eclipse.equinox.simpleconfigurator/bundles.info'
 
@@ -481,7 +483,29 @@ tasks.register('installStatus') {
 		def bundlesInfo = new File(poolDir, bundlesInfoRelPath)
 		def entry = bundlesInfo.isFile() ?
 			bundlesInfo.readLines().find { it.split(',', -1)[0] == bundleSymbolicName } : null
-		println entry ? "line: ${entry}" : "line: ABSENT — run ./gradlew install"
+		if (!entry) {
+			println "line: ABSENT — run ./gradlew install"
+		}
+		else {
+			println "line: ${entry}"
+			// Fields: bsn,version,location,startLevel,autostart. Checking the line exists is
+			// not enough: a p2 operation (or a base flatpak upgrade) may keep it and reset
+			// the autostart flag to false, and then the bundle installs, resolves and never
+			// starts — no Activator, no startup banner in the Error Log, nothing listening
+			// on the port. That failure is invisible unless this flag is asserted.
+			def fields = entry.split(',', -1)
+			def autostart = fields.length > 4 ? fields[4].trim() : ''
+			if (autostart != 'true') {
+				println "line: BROKEN — autostart flag is '${autostart}', must be true; the " +
+					"Activator never runs and no server starts. Re-run ./gradlew install"
+			}
+			def lineVersion = fields.length > 1 ? fields[1].trim() : ''
+			def expectedJar = "${bundleSymbolicName}_${lineVersion}.jar"
+			if (!jars.isEmpty() && !jars.any { it.name == expectedJar }) {
+				println "line: BROKEN — points at ${lineVersion}, but plugins/ has no " +
+					"${expectedJar}. Re-run ./gradlew install"
+			}
+		}
 
 		// Sanity check on the p2 state itself: if simpleconfigurator is not wired in,
 		// bundles.info is not read at all and no amount of installing helps. The user

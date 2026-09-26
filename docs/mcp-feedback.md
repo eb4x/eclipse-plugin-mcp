@@ -67,8 +67,10 @@ Entry template:
 - **Symptom**: `list_launches {}` fails schema validation (`kind` required).
 - **Fix**: `kind` defaults to `active` (the common case); an explicit bad value
   still errors with the enum list. 0.1.1.
-- **Verified**: pending the next coordinated Eclipse restart (the running
-  Ghidra on 8765 is in use by peer sessions; not restarting for a nit).
+- **Verified**: 2026-09-26 against the live 0.2.0 server (raw HTTP handshake,
+  no arguments): `list_launches {}` returned `#2 Ghidra [run] running
+  started=11:40:59 buffered=16 lines` — no schema error, and the default is
+  indeed `active`.
 
 ## 2026-08-31 probe compared against a restamped buildinfo, always "stale"
 
@@ -81,3 +83,54 @@ Entry template:
   newest built jar and compares against that; the task has no build dependencies.
 - **Verified**: probe PASS against the running server; re-running any other
   gradle task no longer flips it to stale.
+
+## 2026-09-26 empty `list_launches kind=active` read as "the tool cannot see it"
+
+- **Context**: a local agent was being taught to start and stop Ghidra through
+  `eclipse-launch`. It called `list_launches` with no arguments on a freshly
+  restarted IDE.
+- **Symptom**: the result was `(none)`. The agent concluded: "returned nothing,
+  which might be because it only lists Eclipse launch configurations, not all
+  running processes on the system" — exactly backwards (a bare call defaults to
+  `kind=active`, i.e. running launches), and it never tried
+  `kind=configurations`, which had 16 entries including `Ghidra`.
+- **Cause**: `(none)` names what is absent but not what to ask instead. An empty
+  `kind=active` is the *normal* state of a just-started IDE, and it looks
+  identical to a capability gap.
+- **Fix (0.2.1)**: `ListLaunchesTool.emptyListing` makes the empty result
+  kind-aware: `kind=active` says nothing has been launched in this session, that
+  launches do not survive an IDE restart, that a process started outside Eclipse
+  is never visible, and points at `kind=configurations` + `manage_launch`;
+  `kind=configurations` distinguishes "no configurations" from "your filter
+  matched none".
+- **Verified**: 2026-09-26 on the live 0.2.1 server, freshly restarted so the
+  session had no launches — the exact state that produced the confusion.
+  `list_launches {}` now returns: `(none) — nothing has been launched in this
+  Eclipse session. Launches do not survive an IDE restart, and a process started
+  outside Eclipse is never visible here. Use list_launches kind=configurations
+  to see what can be launched, then manage_launch op=launch
+  configuration=<name>.` And `kind=configurations` with a non-matching filter:
+  `(none matching filter 'zzzz') — drop the filter to list every
+  configuration.`
+
+## 2026-09-26 p2 kept our bundles.info line but reset the autostart flag
+
+- **Context**: the org.eclipse.Java flatpak upgraded 4.40 → 4.41; afterwards
+  :8124 refused connections and every peer's `eclipse-*` MCP server failed.
+- **Symptom**: the bundle jar was still in the pool and the `bundles.info` line
+  was still present — but ended `,4,false` instead of `,4,true`. The bundle
+  installed and resolved, the Activator never ran: no startup banner in the
+  Error Log, no listener, nothing in `.metadata/.log` mentioning us at all.
+  `./gradlew installStatus` printed the line without objecting.
+- **Cause**: a p2 operation rewriting `bundles.info` from the profile. The
+  documented failure was the line being *dropped*; keeping it with the start
+  flag cleared is the same hazard in a shape that passes a visual check.
+- **Fix (0.2.1)**: `installStatus` asserts the trailing flag is `true` and that
+  the line's version has a matching jar in `plugins/`, printing `line: BROKEN
+  — …` with the remedy. The p2 note in `build.gradle` and CLAUDE.md now describe
+  both shapes.
+- **Verified**: run against a copy of the real pool with the flag flipped to
+  `false` → `line: BROKEN — autostart flag is 'false', must be true; the
+  Activator never runs and no server starts. Re-run ./gradlew install`; and with
+  the jar renamed → `line: BROKEN — points at 0.2.0.202609261000, but plugins/
+  has no …`. The real pool reports clean.

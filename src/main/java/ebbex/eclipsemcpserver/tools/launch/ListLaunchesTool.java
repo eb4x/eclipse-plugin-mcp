@@ -112,8 +112,7 @@ public class ListLaunchesTool implements Tool {
 		};
 
 		if (lines.isEmpty()) {
-			return Results.ok(filter == null ? "(none)"
-					: "(none matching filter '" + filter + "')");
+			return Results.ok(emptyListing(kind, filter));
 		}
 		return Results.ok(page(lines, offset, limit));
 	}
@@ -194,6 +193,28 @@ public class ListLaunchesTool implements Tool {
 
 		entries.sort(Comparator.comparingLong(Entry::started).reversed());
 		return entries.stream().map(Entry::text).toList();
+	}
+
+	/**
+	 * An empty listing, worded so it says what to ask next. A bare "(none)" reads as "this
+	 * server cannot see that", which led one agent to conclude the tool lists only
+	 * configurations and to go hunting for a system process list; an empty {@code kind=active}
+	 * means only that nothing has been launched in this IDE session.
+	 */
+	private static String emptyListing(String kind, String filter) {
+		String none = (filter == null || filter.isEmpty()) ? "(none)"
+				: "(none matching filter '" + filter + "')";
+		String hint = switch (kind) {
+			case "active" -> " — nothing has been launched in this Eclipse session. Launches do " +
+				"not survive an IDE restart, and a process started outside Eclipse is never " +
+				"visible here. Use list_launches kind=configurations to see what can be " +
+				"launched, then manage_launch op=launch configuration=<name>.";
+			case "configurations" -> (filter == null || filter.isEmpty())
+					? " — this workspace has no launch configurations."
+					: " — drop the filter to list every configuration.";
+			default -> "";
+		};
+		return none + hint;
 	}
 
 	/** Prototype check that tolerates a shared handle over a malformed .launch file. */
